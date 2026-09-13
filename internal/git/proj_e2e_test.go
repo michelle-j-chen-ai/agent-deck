@@ -2,6 +2,7 @@ package git
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -117,5 +118,64 @@ func TestProjBackendEndToEnd(t *testing.T) {
 	// `git relocate` is the step most likely to leave a subtly broken worktree.
 	if out, err := exec.Command("git", "-C", worktreePath, "status", "--porcelain").CombinedOutput(); err != nil {
 		t.Errorf("git status in worktree failed: %s: %v", strings.TrimSpace(string(out)), err)
+	}
+}
+
+// TestProjBackendForkPathEndToEnd pins that the fork-with-state creation path
+// reaches the proj backend too. Fork is the operation most worth accelerating
+// (it is how you try a second approach), and it does NOT call CreateWorktree
+// directly — it goes through CreateWorktreeWithStateAndSetup. A refactor that
+// moved that function off runWorktreeAdd would silently return forks to full
+// checkouts, which this catches. Same opt-in as TestProjBackendEndToEnd.
+func TestProjBackendForkPathEndToEnd(t *testing.T) {
+	projectDir := strings.TrimSpace(os.Getenv("AGENT_DECK_PROJ_E2E"))
+	if projectDir == "" {
+		t.Skip("set AGENT_DECK_PROJ_E2E=<proj project dir> to run")
+	}
+	project, ok := resolveProjProject(projectDir)
+	if !ok || !projToolsAvailable() {
+		t.Fatalf("%s is not a usable proj project", projectDir)
+	}
+
+	SetWorktreeBackend(WorktreeBackendProj)
+	t.Cleanup(func() { SetWorktreeBackend(WorktreeBackendAuto) })
+
+	name := fmt.Sprintf("adfork-%d", time.Now().UnixNano())
+	branch := "agent-deck-e2e/" + name
+	repoDir := filepath.Join(project.dir, ".repo")
+	worktreePath := filepath.Join(project.dir, name)
+
+	t.Cleanup(func() {
+		if isDir(worktreePath) {
+			if err := RemoveWorktree(repoDir, worktreePath, true); err != nil {
+				t.Errorf("cleanup: %v", err)
+			}
+		}
+		_ = DeleteBranch(repoDir, branch, true)
+	})
+
+	start := time.Now()
+	setupErr, err := CreateWorktreeWithStateAndSetup(
+		repoDir, worktreePath, branch,
+		WorktreeStateOptions{WithState: true},
+		io.Discard, io.Discard, 60*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("CreateWorktreeWithStateAndSetup: %v", err)
+	}
+	if setupErr != nil {
+		t.Logf("setup script reported: %v (non-fatal)", setupErr)
+	}
+	t.Logf("fork-path worktree created in %s", time.Since(start))
+
+	if !isDir(worktreePath) {
+		t.Fatalf("fork worktree not created at the proj path %s", worktreePath)
+	}
+	if !IsLinkedWorktree(worktreePath) {
+		t.Error("fork worktree is not a linked git worktree")
+	}
+	got, err := GetCurrentBranch(worktreePath)
+	if err != nil || got != branch {
+		t.Errorf("branch = %q (err %v), want %q", got, err, branch)
 	}
 }
